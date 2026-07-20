@@ -54,7 +54,7 @@ env:
   PAKE_VERSION: "3.15.3"
   # Printed in the run log. If a build misbehaves, check this first — an older
   # revision still on the builder repo explains most "the fix didn't work".
-  WORKFLOW_REVISION: "8 - per-build report surfaced in the app"
+  WORKFLOW_REVISION: "9 - deb+rpm de-dup, tooling verified, errors surfaced"
 
 jobs:
   setup:
@@ -90,13 +90,22 @@ jobs:
           PAKE_URL: ${{ inputs.url }}
         run: |
           set -uo pipefail
-          # ImageMagick delegates SVG to rsvg-convert. Without it every SVG icon
-          # fails to convert and the app quietly falls back to Pake's logo.
-          if ! command -v rsvg-convert >/dev/null 2>&1; then
-            sudo apt-get update -qq \
-              && sudo apt-get install -y -qq librsvg2-bin \
-              || echo "::warning::librsvg2-bin unavailable; SVG icons will be skipped"
+          # ImageMagick is NOT guaranteed on GitHub's runner images, and every
+          # convert/identify call below is the difference between a real icon
+          # and Pake's logo. Install it explicitly and say so if it is missing:
+          # silently skipping this is what made icons fail for weeks.
+          if ! command -v convert >/dev/null 2>&1 || ! command -v rsvg-convert >/dev/null 2>&1; then
+            echo "installing image tooling (convert present: $(command -v convert >/dev/null 2>&1 && echo yes || echo no))"
+            sudo apt-get update -qq || true
+            sudo apt-get install -y -qq imagemagick librsvg2-bin || true
           fi
+          if ! command -v convert >/dev/null 2>&1; then
+            echo "::error::ImageMagick is unavailable, so no icon can be prepared."
+            echo "found=false" >> "$GITHUB_OUTPUT"
+            echo "detail=FAILED - ImageMagick missing on the runner" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          echo "image tooling ready: $(convert --version | head -1)"
 
           # Meta answers anything claiming to be Chrome with a 400, while other
           # hosts reject non-browsers, so the page is tried both ways.
@@ -325,10 +334,11 @@ jobs:
 
           echo "Produced:"; ls -la dist/
 
-      # Pake injects its own com.pake.<name>.desktop into both the deb and the
-      # rpm, but only strips Tauri's auto-generated duplicate on the deb path.
-      # The rpm therefore ships two identical launcher entries. Repack it.
-      - name: De-duplicate Linux rpm launcher entry
+      # Pake injects its own com.pake.<name>.desktop alongside the one Tauri's
+      # bundler generates, so packages ship two identical launcher entries. The
+      # report showed this affects the deb as well as the rpm, so both are
+      # rewritten here. dpkg-deb is always present; the rpm path needs tooling.
+      - name: De-duplicate Linux launcher entries
         if: matrix.os == 'linux'
         shell: bash
         continue-on-error: true
@@ -338,9 +348,63 @@ jobs:
         run: |
           set -uo pipefail
           shopt -s nullglob
+          desc="${PAKE_DESC:-$PAKE_NAME}"
+
+          # Keeps one entry, preferring Pake's richer com.pake.* file, and
+          # stamps it so an installed app reveals which pipeline built it.
+          prune() {
+            local appdir="$1" label="$2"
+            local entries=("$appdir"/*.desktop)
+            [ ${#entries[@]} -gt 0 ] || { echo "  $label: no launcher entries"; return; }
+
+            local keep=""
+            for entry in "${entries[@]}"; do
+              case "$(basename "$entry")" in com.pake.*) keep="$entry"; break;; esac
+            done
+            [ -n "$keep" ] || keep="${entries[0]}"
+
+            for entry in "${entries[@]}"; do
+              [ "$entry" = "$keep" ] && continue
+              rm -f "$entry" && echo "  $label: removed duplicate $(basename "$entry")"
+            done
+
+            if grep -q '^Comment=' "$keep"; then
+              sed -i "s|^Comment=.*|Comment=${desc}|" "$keep"
+            else
+              printf 'Comment=%s\n' "$desc" >> "$keep"
+            fi
+            sed -i '/^X-Pake-Builder=/d' "$keep"
+            printf 'X-Pake-Builder=%s\n' "$WORKFLOW_REVISION" >> "$keep"
+            echo "  $label: kept $(basename "$keep")"
+          }
+
+          for deb in dist/*.deb; do
+            work=$(mktemp -d)
+            if dpkg-deb -R "$deb" "$work"; then
+              prune "$work/usr/share/applications" "$(basename "$deb")"
+              dpkg-deb -b "$work" "$deb" >/dev/null && echo "  repacked $(basename "$deb")"
+            else
+              echo "::warning::could not unpack $deb; shipping it as built"
+            fi
+            rm -rf "$work"
+          done
+
           rpms=(dist/*.rpm)
-          [ ${#rpms[@]} -gt 0 ] || { echo "no rpm built, nothing to do"; exit 0; }
-          sudo apt-get update -qq && sudo apt-get install -y -qq rpm cpio
+          [ ${#rpms[@]} -gt 0 ] || exit 0
+
+          for tool in rpm rpm2cpio rpmbuild cpio; do
+            command -v "$tool" >/dev/null 2>&1 || missing="yes"
+          done
+          if [ "${missing:-no}" = "yes" ]; then
+            sudo apt-get update -qq || true
+            sudo apt-get install -y -qq rpm cpio || true
+          fi
+          for tool in rpm rpm2cpio rpmbuild cpio; do
+            if ! command -v "$tool" >/dev/null 2>&1; then
+              echo "::error::$tool unavailable; the rpm keeps its duplicate launcher entry."
+              exit 0
+            fi
+          done
 
           for rpm_in in "${rpms[@]}"; do
             work=$(mktemp -d); root="$work/root"; mkdir -p "$root"
@@ -349,49 +413,14 @@ jobs:
             rel=$( rpm -qp --qf '%{RELEASE}' "$rpm_in" 2>/dev/null)
             arch=$(rpm -qp --qf '%{ARCH}'    "$rpm_in" 2>/dev/null)
             lic=$( rpm -qp --qf '%{LICENSE}' "$rpm_in" 2>/dev/null)
-            desc="${PAKE_DESC:-${PAKE_NAME:-$(rpm -qp --qf '%{SUMMARY}' "$rpm_in" 2>/dev/null)}}"
             if [ -z "$name" ]; then
-              echo "::warning::could not read $rpm_in, leaving it as built"; continue
+              echo "::warning::could not read $rpm_in; shipping it as built"; continue
+            fi
+            if ! rpm2cpio "$rpm_in" | (cd "$root" && cpio -idm --quiet); then
+              echo "::warning::could not extract $rpm_in; shipping it as built"; continue
             fi
 
-            rpm2cpio "$rpm_in" | (cd "$root" && cpio -idm --quiet) || {
-              echo "::warning::could not extract $rpm_in, leaving it as built"; continue; }
-
-            echo "launcher entries before:"
-            ls -1 "$root"/usr/share/applications/ 2>/dev/null | sed 's/^/  /' || echo "  (none)"
-
-            # Keep exactly one launcher entry, whatever the files are called.
-            # Pake ships com.pake.<name>.desktop and Tauri adds its own; only the
-            # deb path strips the duplicate upstream. Preferring com.pake.* keeps
-            # the richer entry (Categories, MimeType) but any single one will do.
-            shopt -s nullglob
-            entries=("$root"/usr/share/applications/*.desktop)
-            keep=""
-            for entry in "${entries[@]}"; do
-              case "$(basename "$entry")" in com.pake.*) keep="$entry"; break;; esac
-            done
-            [ -n "$keep" ] || keep="${entries[0]:-}"
-
-            if [ ${#entries[@]} -gt 1 ] && [ -n "$keep" ]; then
-              for entry in "${entries[@]}"; do
-                [ "$entry" = "$keep" ] && continue
-                rm -f "$entry" && echo "removed duplicate launcher entry: $(basename "$entry")"
-              done
-            elif [ ${#entries[@]} -le 1 ]; then
-              echo "only one launcher entry present - nothing to de-duplicate"
-            fi
-
-            if [ -n "$keep" ]; then
-              if grep -q '^Comment=' "$keep"; then
-                sed -i "s|^Comment=.*|Comment=${desc}|" "$keep"
-              else
-                printf 'Comment=%s\n' "$desc" >> "$keep"
-              fi
-              # Provenance: `grep X-Pake-Builder` on an installed app says which
-              # pipeline produced it, so a stale installer is obvious.
-              sed -i '/^X-Pake-Builder=/d' "$keep"
-              printf 'X-Pake-Builder=%s\n' "$WORKFLOW_REVISION" >> "$keep"
-            fi
+            prune "$root/usr/share/applications" "$(basename "$rpm_in")"
 
             spec="$work/app.spec"
             {
@@ -399,24 +428,25 @@ jobs:
               echo "%define _build_id_links none"
               echo "Name: $name"; echo "Version: $ver"; echo "Release: $rel"
               echo "Summary: $desc"; echo "License: ${lic:-unknown}"
-              echo "Packager: pake-cloud-builder (${WORKFLOW_REVISION})"
               echo "BuildArch: $arch"
+              echo "Packager: pake-cloud-builder (${WORKFLOW_REVISION})"
               echo "%description"; echo "$desc"
               echo "%files"
-              find "$root" -mindepth 1 \( -type f -o -type l \) -printf '/%P\n' | sed 's/[][*?%]/\\&/g'
+              # Quoted so paths containing spaces stay single entries.
+              find "$root" -mindepth 1 \( -type f -o -type l \) -printf '"/%P"\n'
             } > "$spec"
 
             if rpmbuild -bb --define "_topdir $work/rpmbuild" --buildroot "$root" "$spec" > "$work/log" 2>&1; then
               rebuilt=$(find "$work/rpmbuild/RPMS" -name '*.rpm' | head -1)
               if [ -n "$rebuilt" ]; then
                 mv -f "$rebuilt" "$rpm_in"
-                echo "repacked $(basename "$rpm_in") - launcher entries now: $(rpm -qlp "$rpm_in" 2>/dev/null | grep -c '\.desktop$')"
+                echo "  repacked $(basename "$rpm_in")"
               else
-                echo "::warning::rpmbuild produced no package for $rpm_in; shipping it as built"
+                echo "::warning::rpmbuild produced nothing for $rpm_in"
               fi
             else
-              echo "::warning::rpmbuild failed for $rpm_in, shipping it as built"
-              tail -8 "$work/log"
+              echo "::error::rpmbuild failed for $(basename "$rpm_in"); it keeps its duplicate entry"
+              tail -15 "$work/log"
             fi
             rm -rf "$work"
           done
