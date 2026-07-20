@@ -25,6 +25,10 @@ on:
       name:
         description: "Application name"
         required: true
+      description:
+        description: "App description read from the target page"
+        required: false
+        default: ""
       icon:
         description: "Custom icon URL (png/ico/icns)"
         required: false
@@ -115,6 +119,7 @@ jobs:
         env:
           PAKE_URL: ${{ inputs.url }}
           PAKE_NAME: ${{ inputs.name }}
+          PAKE_DESC: ${{ inputs.description }}
           PAKE_ICON: ${{ inputs.icon }}
           PAKE_WIDTH: ${{ inputs.width }}
           PAKE_HEIGHT: ${{ inputs.height }}
@@ -143,6 +148,40 @@ jobs:
           \) -exec mv {} dist/ \;
 
           echo "Produced:"; ls -la dist/
+
+      # Pake has no --description flag (its config schema sets
+      # additionalProperties:false and omits one), so every package inherits
+      # Pake's own tagline. Software centres read the .desktop Comment and the
+      # deb control Description, so rewrite both here. Linux only, and never
+      # fatal: a failed rewrite must not throw away a working installer.
+      - name: Apply description to Linux packages
+        if: matrix.os == 'linux' && inputs.description != ''
+        shell: bash
+        env:
+          PAKE_DESC: ${{ inputs.description }}
+        continue-on-error: true
+        run: |
+          set -uo pipefail
+          shopt -s nullglob
+          escaped=$(printf '%s' "$PAKE_DESC" | tr '\n' ' ' | sed 's/[&|]/\\&/g')
+
+          for deb in dist/*.deb; do
+            work=$(mktemp -d)
+            if ! dpkg-deb -R "$deb" "$work"; then
+              echo "::warning::could not unpack $deb, leaving it as built"
+              rm -rf "$work"; continue
+            fi
+            sed -i "s|^Description:.*|Description: ${escaped}|" "$work/DEBIAN/control"
+            for desktop in "$work"/usr/share/applications/*.desktop; do
+              if grep -q '^Comment=' "$desktop"; then
+                sed -i "s|^Comment=.*|Comment=${escaped}|" "$desktop"
+              else
+                printf 'Comment=%s\n' "$PAKE_DESC" >> "$desktop"
+              fi
+            done
+            dpkg-deb -b "$work" "$deb" >/dev/null && echo "described: $(basename "$deb")"
+            rm -rf "$work"
+          done
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
