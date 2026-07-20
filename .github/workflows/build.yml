@@ -52,15 +52,20 @@ on:
 env:
   # Bump to upgrade Pake. Check versions: https://www.npmjs.com/package/pake-cli
   PAKE_VERSION: "3.15.3"
+  # Printed in the run log. If a build misbehaves, check this first — an older
+  # revision still on the builder repo explains most "the fix didn't work".
+  WORKFLOW_REVISION: "4 - shared icon, crate description, rpm de-duplication"
 
 jobs:
   setup:
     runs-on: ubuntu-latest
     outputs:
       matrix: ${{ steps.gen.outputs.matrix }}
+      icon: ${{ steps.icon.outputs.found }}
     steps:
       - id: gen
         run: |
+          echo "workflow revision: ${WORKFLOW_REVISION}"
           declare -A R=( [linux]=ubuntu-latest [windows]=windows-latest [macos]=macos-latest )
           inc=""
           IFS=',' read -ra sel <<< "${{ inputs.platforms }}"
@@ -71,6 +76,81 @@ jobs:
             fi
           done
           echo "matrix={\"include\":[${inc%,}]}" >> "$GITHUB_OUTPUT"
+
+      # Pake silently falls back to its own logo whenever it cannot fetch a
+      # favicon, which is why packaged apps kept shipping the Pake icon. Resolve
+      # one here, on the only runner guaranteed to have ImageMagick, and share
+      # the result with every platform so all installers agree.
+      - name: Resolve app icon
+        id: icon
+        shell: bash
+        env:
+          PAKE_ICON: ${{ inputs.icon }}
+          PAKE_URL: ${{ inputs.url }}
+        run: |
+          set -uo pipefail
+          UA='Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36'
+          host=$(node -e 'process.stdout.write(new URL(process.argv[1]).host)' "$PAKE_URL")
+          origin=$(node -e 'const u=new URL(process.argv[1]);process.stdout.write(u.origin)' "$PAKE_URL")
+
+          # Icons declared by the page itself, largest first.
+          page_icons=$(curl -fsSL --max-time 20 -A "$UA" "$PAKE_URL" 2>/dev/null | node -e '
+            let html = "";
+            process.stdin.on("data", (c) => (html += c)).on("end", () => {
+              const base = process.argv[1];
+              const found = [];
+              for (const tag of html.match(/<link\b[^>]*>/gi) || []) {
+                const rel = (tag.match(/rel=["\047]([^"\047]+)["\047]/i) || [])[1];
+                const href = (tag.match(/href=["\047]([^"\047]+)["\047]/i) || [])[1];
+                if (!rel || !href) continue;
+                const tokens = rel.toLowerCase().split(/\s+/);
+                if (!tokens.includes("icon") && !tokens.includes("apple-touch-icon")) continue;
+                const size = tag.match(/sizes=["\047](\d+)x\d+["\047]/i);
+                found.push({ href, area: size ? Number(size[1]) : 0 });
+              }
+              found.sort((a, b) => b.area - a.area);
+              for (const f of found) { try { console.log(new URL(f.href, base).href); } catch {} }
+            });
+          ' "$PAKE_URL" || true)
+
+          # Built line by line: a multi-line shell string would need column-0
+          # continuation lines, which would terminate this YAML block scalar.
+          : > candidates.txt
+          [ -n "$PAKE_ICON" ] && printf '%s\n' "$PAKE_ICON" >> candidates.txt
+          [ -n "$page_icons" ] && printf '%s\n' "$page_icons" >> candidates.txt
+          printf '%s\n' "$origin/apple-touch-icon.png" >> candidates.txt
+          printf '%s\n' "$origin/favicon.ico" >> candidates.txt
+          printf '%s\n' "https://icons.duckduckgo.com/ip3/${host}.ico" >> candidates.txt
+          printf '%s\n' "https://www.google.com/s2/favicons?domain=${host}&sz=256" >> candidates.txt
+
+          resolved=""
+          while IFS= read -r candidate; do
+            [ -n "$candidate" ] || continue
+            curl -fsSL --max-time 20 -A "$UA" -e "$PAKE_URL" "$candidate" -o raw.bin 2>/dev/null || continue
+            [ -s raw.bin ] || continue
+            # ImageMagick reads ico/png/jpg/webp/svg and normalises to a square PNG.
+            if convert "raw.bin[0]" -background none -resize 512x512\> \
+                 -gravity center -extent 512x512 PNG32:icon.png 2>/dev/null; then
+              px=$(identify -format '%w' icon.png 2>/dev/null || echo 0)
+              if [ "${px:-0}" -ge 48 ]; then resolved="$candidate"; break; fi
+            fi
+          done < candidates.txt
+
+          if [ -n "$resolved" ]; then
+            echo "resolved app icon from: $resolved"
+            echo "found=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "::warning::no usable icon found for $host - the app will ship Pake's default logo"
+            echo "found=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Share resolved icon
+        if: steps.icon.outputs.found == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: resolved-icon
+          path: icon.png
+          retention-days: 1
 
   build:
     needs: setup
@@ -121,12 +201,15 @@ jobs:
       # packaged app has been advertising Pake's own tagline. Rewriting that one
       # line before the build fixes deb, rpm, AppImage, msi and dmg together.
       - name: Set app description
-        if: inputs.description != ''
         shell: bash
         env:
           PAKE_DESC: ${{ inputs.description }}
+          PAKE_NAME: ${{ inputs.name }}
         run: |
           set -uo pipefail
+          # With no description supplied the app name still beats advertising
+          # Pake's tagline in every software centre.
+          desc="${PAKE_DESC:-$PAKE_NAME}"
           manifest="$(npm root -g)/pake-cli/src-tauri/Cargo.toml"
           if [ ! -f "$manifest" ]; then
             echo "::warning::$manifest not found; keeping Pake's own description"
@@ -139,37 +222,25 @@ jobs:
             const after = before.replace(/^description\s*=\s*".*"$/m, "description = " + JSON.stringify(desc));
             if (after === before) { console.log("::warning::no description line in Cargo.toml"); }
             else { fs.writeFileSync(file, after); console.log("app description set to: " + desc); }
-          ' "$manifest" "$PAKE_DESC"
+          ' "$manifest" "$desc"
 
-      # Pake silently falls back to its own icon when a favicon cannot be
-      # fetched, which is how apps ended up shipping the Pake logo. Resolve the
-      # icon here so a failure is visible in the log instead.
-      - name: Fetch app icon
-        if: inputs.icon != ''
+      - name: Get resolved icon
+        if: needs.setup.outputs.icon == 'true'
+        uses: actions/download-artifact@v4
+        with:
+          name: resolved-icon
+
+      - name: Locate icon
+        if: needs.setup.outputs.icon == 'true'
         shell: bash
-        env:
-          PAKE_ICON: ${{ inputs.icon }}
         run: |
           set -uo pipefail
-          if ! curl -fsSL --max-time 30 "$PAKE_ICON" -o icon.bin; then
-            echo "::warning::could not download $PAKE_ICON - falling back to the site favicon"
-            exit 0
+          if [ -f icon.png ]; then
+            echo "PAKE_ICON_FILE=$(pwd)/icon.png" >> "$GITHUB_ENV"
+            echo "using shared icon: $(pwd)/icon.png"
+          else
+            echo "::warning::resolved icon missing on this runner; Pake will use its fallback"
           fi
-          ext=$(node -e '
-            const b = require("fs").readFileSync("icon.bin");
-            const is = (...bytes) => bytes.every((v, i) => b[i] === v);
-            if (is(0x89,0x50,0x4e,0x47)) process.stdout.write("png");
-            else if (is(0x00,0x00,0x01,0x00)) process.stdout.write("ico");
-            else if (b.slice(0,4).toString() === "icns") process.stdout.write("icns");
-            else process.stdout.write("");
-          ')
-          if [ -z "$ext" ]; then
-            echo "::warning::$PAKE_ICON is not a PNG, ICO or ICNS - falling back to the site favicon"
-            exit 0
-          fi
-          mv icon.bin "app-icon.$ext"
-          echo "PAKE_ICON_FILE=$(pwd)/app-icon.$ext" >> "$GITHUB_ENV"
-          echo "using icon: app-icon.$ext"
 
       - name: Build
         shell: bash
