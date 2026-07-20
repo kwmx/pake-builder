@@ -1,0 +1,134 @@
+name: Build Pake App
+run-name: "build ${{ inputs.build_id }}"
+
+# This workflow lives in a PUBLIC "builder" repo. The Pake Cloud Builder web app
+# triggers it over the REST API and reads back the artifacts:
+#   POST /repos/{owner}/{repo}/actions/workflows/build.yml/dispatches
+#   body: { "ref": "main", "inputs": { url, name, icon, width, height, platforms, build_id } }
+# The matrix runs only the OSes listed in `platforms`. `build_id` is echoed into
+# run-name so the caller can correlate the dispatch with its run id.
+#
+# Linux emits .deb + .rpm + .AppImage (via the Pake CLI directly, since the Pake
+# action only exports a single package). Windows (.msi) and macOS (.dmg) use the
+# action, which handles their platform-specific toolchains.
+
+on:
+  workflow_dispatch:
+    inputs:
+      url:
+        description: "Target URL to package"
+        required: true
+      name:
+        description: "Application name"
+        required: true
+      icon:
+        description: "Custom icon URL (png/ico/icns)"
+        required: false
+        default: ""
+      width:
+        description: "Window width"
+        required: false
+        default: "1200"
+      height:
+        description: "Window height"
+        required: false
+        default: "780"
+      platforms:
+        description: "Comma list: linux,windows,macos"
+        required: false
+        default: "linux,windows,macos"
+      build_id:
+        description: "Correlation id set by the web app"
+        required: true
+
+jobs:
+  setup:
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.gen.outputs.matrix }}
+    steps:
+      - id: gen
+        run: |
+          declare -A R=( [linux]=ubuntu-latest [windows]=windows-latest [macos]=macos-latest )
+          inc=""
+          IFS=',' read -ra sel <<< "${{ inputs.platforms }}"
+          for p in "${sel[@]}"; do
+            p=$(echo "$p" | xargs)
+            if [ -n "${R[$p]:-}" ]; then
+              inc="${inc}{\"os\":\"$p\",\"runner\":\"${R[$p]}\"},"
+            fi
+          done
+          echo "matrix={\"include\":[${inc%,}]}" >> "$GITHUB_OUTPUT"
+
+  build:
+    needs: setup
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.setup.outputs.matrix) }}
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+
+      # ---------- Windows & macOS: the Pake action handles their toolchains ----------
+      - name: Build with Pake (Windows/macOS)
+        if: matrix.os != 'linux'
+        uses: tw93/Pake@v3
+        with:
+          url: ${{ inputs.url }}
+          name: ${{ inputs.name }}
+          icon: ${{ inputs.icon }}
+          width: ${{ inputs.width }}
+          height: ${{ inputs.height }}
+          output-dir: dist
+
+      # ---------- Linux: drive the CLI directly to emit deb + rpm + appimage ----------
+      - name: Set up Node (Linux)
+        if: matrix.os == 'linux'
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: Set up Rust (Linux)
+        if: matrix.os == 'linux'
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install Linux build dependencies
+        if: matrix.os == 'linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libwebkit2gtk-4.1-dev libgtk-3-dev librsvg2-dev \
+            libayatana-appindicator3-dev libssl-dev libxdo-dev file rpm
+
+      - name: Install Pake CLI
+        if: matrix.os == 'linux'
+        run: npm install -g pake-cli   # pin e.g. pake-cli@3.x for full reproducibility
+
+      - name: Build deb, rpm and appimage
+        if: matrix.os == 'linux'
+        env:
+          PAKE_URL: ${{ inputs.url }}
+          PAKE_NAME: ${{ inputs.name }}
+          PAKE_ICON: ${{ inputs.icon }}
+          PAKE_WIDTH: ${{ inputs.width }}
+          PAKE_HEIGHT: ${{ inputs.height }}
+          APPIMAGE_EXTRACT_AND_RUN: "1"   # build AppImage without FUSE on the runner
+          NO_STRIP: "1"
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          args=(--name "$PAKE_NAME" --width "$PAKE_WIDTH" --height "$PAKE_HEIGHT" --targets deb,rpm,appimage)
+          if [ -n "$PAKE_ICON" ]; then args+=(--icon "$PAKE_ICON"); fi
+          # The CLI keeps building remaining formats if one fails (e.g. AppImage),
+          # so deb+rpm still ship. It drops finished installers in the working dir.
+          pake "$PAKE_URL" "${args[@]}"
+          find . -maxdepth 1 -type f \( -iname '*.deb' -o -iname '*.rpm' -o -iname '*.AppImage' \) -exec mv -t dist/ {} +
+          echo "Produced:"; ls -la dist/
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ inputs.name }}-${{ matrix.os }}
+          path: dist/**
+          if-no-files-found: error
+          retention-days: 7
