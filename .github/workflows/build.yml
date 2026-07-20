@@ -8,9 +8,13 @@ run-name: "build ${{ inputs.build_id }}"
 # The matrix runs only the OSes listed in `platforms`. `build_id` is echoed into
 # run-name so the caller can correlate the dispatch with its run id.
 #
-# Linux emits .deb + .rpm + .AppImage (via the Pake CLI directly, since the Pake
-# action only exports a single package). Windows (.msi) and macOS (.dmg) use the
-# action, which handles their platform-specific toolchains.
+# Every platform drives the `pake-cli` npm package directly rather than the
+# tw93/Pake action: one mechanism, one version to pin, and no reliance on action
+# tags (Pake publishes only full versions like V3.15.1 — there is no moving v3).
+#
+# Formats: Linux -> .deb + .rpm + .AppImage   Windows -> .msi   macOS -> .dmg
+# On Windows/macOS the CLI's --targets flag selects ARCHITECTURE, not format,
+# so it is omitted there and the default (host arch) is used.
 
 on:
   workflow_dispatch:
@@ -41,6 +45,10 @@ on:
         description: "Correlation id set by the web app"
         required: true
 
+env:
+  # Bump to upgrade Pake. Check versions: https://www.npmjs.com/package/pake-cli
+  PAKE_VERSION: "3.15.3"
+
 jobs:
   setup:
     runs-on: ubuntu-latest
@@ -69,29 +77,16 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      # ---------- Windows & macOS: the Pake action handles their toolchains ----------
-      - name: Build with Pake (Windows/macOS)
-        if: matrix.os != 'linux'
-        uses: tw93/Pake@v3
-        with:
-          url: ${{ inputs.url }}
-          name: ${{ inputs.name }}
-          icon: ${{ inputs.icon }}
-          width: ${{ inputs.width }}
-          height: ${{ inputs.height }}
-          output-dir: dist
-
-      # ---------- Linux: drive the CLI directly to emit deb + rpm + appimage ----------
-      - name: Set up Node (Linux)
-        if: matrix.os == 'linux'
+      - name: Set up Node
         uses: actions/setup-node@v4
         with:
           node-version: "20"
 
-      - name: Set up Rust (Linux)
-        if: matrix.os == 'linux'
+      - name: Set up Rust
         uses: dtolnay/rust-toolchain@stable
 
+      # Linux is the only platform needing extra system libraries; Windows
+      # (MSVC + WebView2) and macOS (Xcode CLT) come ready on their runners.
       - name: Install Linux build dependencies
         if: matrix.os == 'linux'
         run: |
@@ -100,12 +95,19 @@ jobs:
             libwebkit2gtk-4.1-dev libgtk-3-dev librsvg2-dev \
             libayatana-appindicator3-dev libssl-dev libxdo-dev file rpm
 
-      - name: Install Pake CLI
-        if: matrix.os == 'linux'
-        run: npm install -g pake-cli   # pin e.g. pake-cli@3.x for full reproducibility
+      # For a universal macOS .dmg (Intel + Apple Silicon) instead of the
+      # runner-native arm64 build, uncomment this step and add `--targets
+      # universal` to the args below. Doubles build time.
+      # - name: Add macOS universal targets
+      #   if: matrix.os == 'macos'
+      #   run: rustup target add x86_64-apple-darwin aarch64-apple-darwin
 
-      - name: Build deb, rpm and appimage
-        if: matrix.os == 'linux'
+      - name: Install Pake CLI
+        shell: bash
+        run: npm install -g "pake-cli@${PAKE_VERSION}"
+
+      - name: Build
+        shell: bash
         env:
           PAKE_URL: ${{ inputs.url }}
           PAKE_NAME: ${{ inputs.name }}
@@ -117,12 +119,25 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p dist
-          args=(--name "$PAKE_NAME" --width "$PAKE_WIDTH" --height "$PAKE_HEIGHT" --targets deb,rpm,appimage)
-          if [ -n "$PAKE_ICON" ]; then args+=(--icon "$PAKE_ICON"); fi
-          # The CLI keeps building remaining formats if one fails (e.g. AppImage),
-          # so deb+rpm still ship. It drops finished installers in the working dir.
+
+          args=(--name "$PAKE_NAME" --width "$PAKE_WIDTH" --height "$PAKE_HEIGHT")
+          if [ -n "$PAKE_ICON" ]; then
+            args+=(--icon "$PAKE_ICON")
+          fi
+          # Linux is the only platform where --targets selects FORMATS. The CLI
+          # keeps going if one format fails, so .deb/.rpm still ship even if the
+          # AppImage step breaks.
+          if [ "${{ matrix.os }}" = "linux" ]; then
+            args+=(--targets deb,rpm,appimage)
+          fi
+
           pake "$PAKE_URL" "${args[@]}"
-          find . -maxdepth 1 -type f \( -iname '*.deb' -o -iname '*.rpm' -o -iname '*.AppImage' \) -exec mv -t dist/ {} +
+
+          find . -maxdepth 1 -type f \( \
+            -iname '*.deb' -o -iname '*.rpm' -o -iname '*.AppImage' \
+            -o -iname '*.msi' -o -iname '*.exe' -o -iname '*.dmg' \
+          \) -exec mv {} dist/ \;
+
           echo "Produced:"; ls -la dist/
 
       - name: Upload artifact
