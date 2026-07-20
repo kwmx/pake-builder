@@ -54,7 +54,7 @@ env:
   PAKE_VERSION: "3.15.3"
   # Printed in the run log. If a build misbehaves, check this first — an older
   # revision still on the builder repo explains most "the fix didn't work".
-  WORKFLOW_REVISION: "7 - icon rounding fixed, de-dup hardened, provenance stamped"
+  WORKFLOW_REVISION: "8 - per-build report surfaced in the app"
 
 jobs:
   setup:
@@ -62,6 +62,7 @@ jobs:
     outputs:
       matrix: ${{ steps.gen.outputs.matrix }}
       icon: ${{ steps.icon.outputs.found }}
+      iconDetail: ${{ steps.icon.outputs.detail }}
     steps:
       - id: gen
         run: |
@@ -178,9 +179,11 @@ jobs:
               echo "icon already has transparency - left as-is"
             fi
             echo "found=true" >> "$GITHUB_OUTPUT"
+            echo "detail=$(identify -format '%wx%h' icon.png 2>/dev/null || echo unknown) from ${resolved}" >> "$GITHUB_OUTPUT"
           else
             echo "::warning::no usable icon found for $host - the app will ship Pake's default logo"
             echo "found=false" >> "$GITHUB_OUTPUT"
+            echo "detail=none resolved - Pake will use its own logo" >> "$GITHUB_OUTPUT"
           fi
 
       - name: Share resolved icon
@@ -417,6 +420,36 @@ jobs:
             fi
             rm -rf "$work"
           done
+
+      # Shipped inside the artifact so the app can state, in its own build log,
+      # exactly what came out. Without this neither of us can tell which
+      # revision produced a given installer.
+      - name: Write build report
+        shell: bash
+        env:
+          PAKE_DESC: ${{ inputs.description }}
+          PAKE_NAME: ${{ inputs.name }}
+          ICON_DETAIL: ${{ needs.setup.outputs.iconDetail }}
+        run: |
+          set -uo pipefail
+          shopt -s nullglob
+          desc="${PAKE_DESC:-$PAKE_NAME}"
+          {
+            echo "revision: ${WORKFLOW_REVISION}"
+            if [ -n "$PAKE_DESC" ]; then
+              echo "description: sent by the app (${#PAKE_DESC} chars)"
+            else
+              echo "description: NOT SENT - fell back to the app name \"${PAKE_NAME}\""
+            fi
+            echo "icon: ${ICON_DETAIL:-unknown}"
+            for pkg in dist/*.rpm; do
+              echo "launchers in $(basename "$pkg"): $(rpm -qlp "$pkg" 2>/dev/null | grep -c '\.desktop$')"
+            done
+            for pkg in dist/*.deb; do
+              echo "launchers in $(basename "$pkg"): $(dpkg-deb -c "$pkg" 2>/dev/null | grep -c '\.desktop$')"
+            done
+          } > dist/build-report.txt
+          cat dist/build-report.txt
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
