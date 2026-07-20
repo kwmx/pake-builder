@@ -54,7 +54,7 @@ env:
   PAKE_VERSION: "3.15.3"
   # Printed in the run log. If a build misbehaves, check this first — an older
   # revision still on the builder repo explains most "the fix didn't work".
-  WORKFLOW_REVISION: "6 - any image format for icons, scaled to fill"
+  WORKFLOW_REVISION: "7 - icon rounding fixed, de-dup hardened, provenance stamped"
 
 jobs:
   setup:
@@ -160,7 +160,10 @@ jobs:
             # Full-bleed square logos sit badly beside the padded, rounded icons
             # a desktop normally shows. Inset and round those; anything that
             # already carries transparency is deliberately shaped, so leave it.
-            opaque=$(identify -format '%[opaque]' icon.png 2>/dev/null || echo unknown)
+            # Must be measured on the SOURCE: icon.png already carries the
+            # transparent padding added by -extent, so it always reads as
+            # non-opaque and this branch would never run.
+            opaque=$(identify -format '%[opaque]' "raw.bin[0]" 2>/dev/null || echo unknown)
             if [ "$opaque" = "true" ] || [ "$opaque" = "True" ]; then
               if cp icon.png _base.png \
                  && convert -size 512x512 xc:black -fill white \
@@ -245,6 +248,11 @@ jobs:
           set -uo pipefail
           # With no description supplied the app name still beats advertising
           # Pake's tagline in every software centre.
+          if [ -n "$PAKE_DESC" ]; then
+            echo "description received (${#PAKE_DESC} chars): $PAKE_DESC"
+          else
+            echo "::warning::no description was sent by the app; falling back to the app name"
+          fi
           desc="${PAKE_DESC:-$PAKE_NAME}"
           manifest="$(npm root -g)/pake-cli/src-tauri/Cargo.toml"
           if [ ! -f "$manifest" ]; then
@@ -323,6 +331,7 @@ jobs:
         continue-on-error: true
         env:
           PAKE_DESC: ${{ inputs.description }}
+          PAKE_NAME: ${{ inputs.name }}
         run: |
           set -uo pipefail
           shopt -s nullglob
@@ -337,7 +346,7 @@ jobs:
             rel=$( rpm -qp --qf '%{RELEASE}' "$rpm_in" 2>/dev/null)
             arch=$(rpm -qp --qf '%{ARCH}'    "$rpm_in" 2>/dev/null)
             lic=$( rpm -qp --qf '%{LICENSE}' "$rpm_in" 2>/dev/null)
-            desc="${PAKE_DESC:-$(rpm -qp --qf '%{SUMMARY}' "$rpm_in" 2>/dev/null)}"
+            desc="${PAKE_DESC:-${PAKE_NAME:-$(rpm -qp --qf '%{SUMMARY}' "$rpm_in" 2>/dev/null)}}"
             if [ -z "$name" ]; then
               echo "::warning::could not read $rpm_in, leaving it as built"; continue
             fi
@@ -348,32 +357,38 @@ jobs:
             echo "launcher entries before:"
             ls -1 "$root"/usr/share/applications/ 2>/dev/null | sed 's/^/  /' || echo "  (none)"
 
-            # Pake ships com.pake.<name>.desktop; Tauri adds <name>.desktop.
-            # Keep Pake's (it has Categories and MimeType) and drop the other.
-            own=$(ls "$root"/usr/share/applications/com.pake.*.desktop 2>/dev/null | head -1)
-            removed=0
-            if [ -n "$own" ]; then
-              for entry in "$root"/usr/share/applications/*.desktop; do
-                [ "$entry" = "$own" ] && continue
-                rm -f "$entry" && removed=$((removed+1))
-                echo "removed duplicate launcher entry: $(basename "$entry")"
+            # Keep exactly one launcher entry, whatever the files are called.
+            # Pake ships com.pake.<name>.desktop and Tauri adds its own; only the
+            # deb path strips the duplicate upstream. Preferring com.pake.* keeps
+            # the richer entry (Categories, MimeType) but any single one will do.
+            shopt -s nullglob
+            entries=("$root"/usr/share/applications/*.desktop)
+            keep=""
+            for entry in "${entries[@]}"; do
+              case "$(basename "$entry")" in com.pake.*) keep="$entry"; break;; esac
+            done
+            [ -n "$keep" ] || keep="${entries[0]:-}"
+
+            if [ ${#entries[@]} -gt 1 ] && [ -n "$keep" ]; then
+              for entry in "${entries[@]}"; do
+                [ "$entry" = "$keep" ] && continue
+                rm -f "$entry" && echo "removed duplicate launcher entry: $(basename "$entry")"
               done
-            fi
-            remaining=$(ls -1 "$root"/usr/share/applications/*.desktop 2>/dev/null | wc -l)
-            if [ "$remaining" -gt 1 ]; then
-              echo "::warning::$remaining launcher entries remain in $(basename "$rpm_in")"
-            elif [ "$removed" -eq 0 ]; then
+            elif [ ${#entries[@]} -le 1 ]; then
               echo "only one launcher entry present - nothing to de-duplicate"
             fi
 
-            for entry in "$root"/usr/share/applications/*.desktop; do
-              [ -f "$entry" ] || continue
-              if grep -q '^Comment=' "$entry"; then
-                sed -i "s|^Comment=.*|Comment=${desc}|" "$entry"
+            if [ -n "$keep" ]; then
+              if grep -q '^Comment=' "$keep"; then
+                sed -i "s|^Comment=.*|Comment=${desc}|" "$keep"
               else
-                printf 'Comment=%s\n' "$desc" >> "$entry"
+                printf 'Comment=%s\n' "$desc" >> "$keep"
               fi
-            done
+              # Provenance: `grep X-Pake-Builder` on an installed app says which
+              # pipeline produced it, so a stale installer is obvious.
+              sed -i '/^X-Pake-Builder=/d' "$keep"
+              printf 'X-Pake-Builder=%s\n' "$WORKFLOW_REVISION" >> "$keep"
+            fi
 
             spec="$work/app.spec"
             {
@@ -381,6 +396,7 @@ jobs:
               echo "%define _build_id_links none"
               echo "Name: $name"; echo "Version: $ver"; echo "Release: $rel"
               echo "Summary: $desc"; echo "License: ${lic:-unknown}"
+              echo "Packager: pake-cloud-builder (${WORKFLOW_REVISION})"
               echo "BuildArch: $arch"
               echo "%description"; echo "$desc"
               echo "%files"
