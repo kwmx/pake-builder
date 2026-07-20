@@ -25,7 +25,10 @@ on:
       name:
         description: "Application name"
         required: true
-      description:
+      # Deliberately not called "description": each workflow_dispatch input
+      # already has a property of that name, so an input named description
+      # nests as description.description. Renaming removes the ambiguity.
+      app_description:
         description: "App description read from the target page"
         required: false
         default: ""
@@ -54,7 +57,7 @@ env:
   PAKE_VERSION: "3.15.3"
   # Printed in the run log. If a build misbehaves, check this first — an older
   # revision still on the builder repo explains most "the fix didn't work".
-  WORKFLOW_REVISION: "9 - deb+rpm de-dup, tooling verified, errors surfaced"
+  WORKFLOW_REVISION: "10 - input renamed, rpm scriptlets disabled"
 
 jobs:
   setup:
@@ -254,7 +257,7 @@ jobs:
       - name: Set app description
         shell: bash
         env:
-          PAKE_DESC: ${{ inputs.description }}
+          PAKE_DESC: ${{ inputs.app_description }}
           PAKE_NAME: ${{ inputs.name }}
         run: |
           set -uo pipefail
@@ -303,7 +306,7 @@ jobs:
         env:
           PAKE_URL: ${{ inputs.url }}
           PAKE_NAME: ${{ inputs.name }}
-          PAKE_DESC: ${{ inputs.description }}
+          PAKE_DESC: ${{ inputs.app_description }}
           PAKE_ICON: ${{ inputs.icon }}
           PAKE_WIDTH: ${{ inputs.width }}
           PAKE_HEIGHT: ${{ inputs.height }}
@@ -343,7 +346,7 @@ jobs:
         shell: bash
         continue-on-error: true
         env:
-          PAKE_DESC: ${{ inputs.description }}
+          PAKE_DESC: ${{ inputs.app_description }}
           PAKE_NAME: ${{ inputs.name }}
         run: |
           set -uo pipefail
@@ -422,9 +425,15 @@ jobs:
 
             prune "$root/usr/share/applications" "$(basename "$rpm_in")"
 
+            mkdir -p "$work/rpmbuild/BUILD" "$work/rpmbuild/RPMS" "$work/rpmbuild/SOURCES" \
+                     "$work/rpmbuild/SPECS" "$work/rpmbuild/SRPMS"
             spec="$work/app.spec"
             {
               echo "%global debug_package %{nil}"
+              echo "%global __os_install_post %{nil}"
+              echo "%global __arch_install_post %{nil}"
+              echo "%global __brp_check_rpaths %{nil}"
+              echo "%global _enable_debug_packages 0"
               echo "%define _build_id_links none"
               echo "Name: $name"; echo "Version: $ver"; echo "Release: $rel"
               echo "Summary: $desc"; echo "License: ${lic:-unknown}"
@@ -447,6 +456,7 @@ jobs:
             else
               echo "::error::rpmbuild failed for $(basename "$rpm_in"); it keeps its duplicate entry"
               tail -15 "$work/log"
+              printf 'rpm repack FAILED: %s\n' "$(tail -3 "$work/log" | tr '\n' ' ')" >> dedup-notes.txt
             fi
             rm -rf "$work"
           done
@@ -457,15 +467,17 @@ jobs:
       - name: Write build report
         shell: bash
         env:
-          PAKE_DESC: ${{ inputs.description }}
+          PAKE_DESC: ${{ inputs.app_description }}
           PAKE_NAME: ${{ inputs.name }}
           ICON_DETAIL: ${{ needs.setup.outputs.iconDetail }}
+          ICON_SENT: ${{ inputs.icon }}
         run: |
           set -uo pipefail
           shopt -s nullglob
           desc="${PAKE_DESC:-$PAKE_NAME}"
           {
             echo "revision: ${WORKFLOW_REVISION}"
+            echo "inputs received: name=${#PAKE_NAME}ch app_description=${#PAKE_DESC}ch icon=${ICON_SENT:+set}${ICON_SENT:-unset}"
             if [ -n "$PAKE_DESC" ]; then
               echo "description: sent by the app (${#PAKE_DESC} chars)"
             else
@@ -478,6 +490,7 @@ jobs:
             for pkg in dist/*.deb; do
               echo "launchers in $(basename "$pkg"): $(dpkg-deb -c "$pkg" 2>/dev/null | grep -c '\.desktop$')"
             done
+            [ -f dedup-notes.txt ] && cat dedup-notes.txt
           } > dist/build-report.txt
           cat dist/build-report.txt
 
