@@ -54,7 +54,7 @@ env:
   PAKE_VERSION: "3.15.3"
   # Printed in the run log. If a build misbehaves, check this first — an older
   # revision still on the builder repo explains most "the fix didn't work".
-  WORKFLOW_REVISION: "4 - shared icon, crate description, rpm de-duplication"
+  WORKFLOW_REVISION: "5 - icon polish, verified rpm de-duplication"
 
 jobs:
   setup:
@@ -138,6 +138,27 @@ jobs:
 
           if [ -n "$resolved" ]; then
             echo "resolved app icon from: $resolved"
+            src_px=$(identify -format '%w' "raw.bin[0]" 2>/dev/null || echo 0)
+            [ "${src_px:-0}" -lt 128 ] && echo "::warning::source icon is only ${src_px}px wide; it will look soft at desktop sizes"
+
+            # Full-bleed square logos sit badly beside the padded, rounded icons
+            # a desktop normally shows. Inset and round those; anything that
+            # already carries transparency is deliberately shaped, so leave it.
+            opaque=$(identify -format '%[opaque]' icon.png 2>/dev/null || echo unknown)
+            if [ "$opaque" = "true" ] || [ "$opaque" = "True" ]; then
+              if convert icon.png -resize 448x448 -background none -gravity center \
+                   -extent 512x512 PNG32:_base.png 2>/dev/null \
+                 && convert -size 512x512 xc:black -fill white \
+                      -draw "roundrectangle 32,32 479,479 96,96" -alpha off _mask.png 2>/dev/null \
+                 && convert _base.png _mask.png -alpha off -compose CopyOpacity \
+                      -composite PNG32:_out.png 2>/dev/null; then
+                mv _out.png icon.png
+                echo "inset and rounded a full-bleed icon"
+              fi
+              rm -f _base.png _mask.png
+            else
+              echo "icon already has transparency - left as-is"
+            fi
             echo "found=true" >> "$GITHUB_OUTPUT"
           else
             echo "::warning::no usable icon found for $host - the app will ship Pake's default logo"
@@ -309,13 +330,25 @@ jobs:
             rpm2cpio "$rpm_in" | (cd "$root" && cpio -idm --quiet) || {
               echo "::warning::could not extract $rpm_in, leaving it as built"; continue; }
 
-            dup="$root/usr/share/applications/${name}.desktop"
-            own="$root/usr/share/applications/com.pake.${name}.desktop"
-            if [ -f "$dup" ] && [ -f "$own" ]; then
-              rm -f "$dup"
-              echo "removed duplicate launcher entry: ${name}.desktop"
-            else
-              echo "no duplicate found in $(basename "$rpm_in") - upstream may have fixed it"
+            echo "launcher entries before:"
+            ls -1 "$root"/usr/share/applications/ 2>/dev/null | sed 's/^/  /' || echo "  (none)"
+
+            # Pake ships com.pake.<name>.desktop; Tauri adds <name>.desktop.
+            # Keep Pake's (it has Categories and MimeType) and drop the other.
+            own=$(ls "$root"/usr/share/applications/com.pake.*.desktop 2>/dev/null | head -1)
+            removed=0
+            if [ -n "$own" ]; then
+              for entry in "$root"/usr/share/applications/*.desktop; do
+                [ "$entry" = "$own" ] && continue
+                rm -f "$entry" && removed=$((removed+1))
+                echo "removed duplicate launcher entry: $(basename "$entry")"
+              done
+            fi
+            remaining=$(ls -1 "$root"/usr/share/applications/*.desktop 2>/dev/null | wc -l)
+            if [ "$remaining" -gt 1 ]; then
+              echo "::warning::$remaining launcher entries remain in $(basename "$rpm_in")"
+            elif [ "$removed" -eq 0 ]; then
+              echo "only one launcher entry present - nothing to de-duplicate"
             fi
 
             for entry in "$root"/usr/share/applications/*.desktop; do
@@ -341,7 +374,12 @@ jobs:
 
             if rpmbuild -bb --define "_topdir $work/rpmbuild" --buildroot "$root" "$spec" > "$work/log" 2>&1; then
               rebuilt=$(find "$work/rpmbuild/RPMS" -name '*.rpm' | head -1)
-              [ -n "$rebuilt" ] && mv -f "$rebuilt" "$rpm_in" && echo "repacked $(basename "$rpm_in")"
+              if [ -n "$rebuilt" ]; then
+                mv -f "$rebuilt" "$rpm_in"
+                echo "repacked $(basename "$rpm_in") - launcher entries now: $(rpm -qlp "$rpm_in" 2>/dev/null | grep -c '\.desktop$')"
+              else
+                echo "::warning::rpmbuild produced no package for $rpm_in; shipping it as built"
+              fi
             else
               echo "::warning::rpmbuild failed for $rpm_in, shipping it as built"
               tail -8 "$work/log"
