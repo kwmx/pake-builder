@@ -57,7 +57,7 @@ env:
   PAKE_VERSION: "3.15.3"
   # Printed in the run log. If a build misbehaves, check this first — an older
   # revision still on the builder repo explains most "the fix didn't work".
-  WORKFLOW_REVISION: "10 - input renamed, rpm scriptlets disabled"
+  WORKFLOW_REVISION: "11 - rpm duplicate fixed at source"
 
 jobs:
   setup:
@@ -283,6 +283,34 @@ jobs:
             else { fs.writeFileSync(file, after); console.log("app description set to: " + desc); }
           ' "$manifest" "$desc"
 
+      # Pake writes its own com.pake.<name>.desktop into BOTH the deb and the
+      # rpm, but only removes Tauri's auto-generated duplicate on the deb path.
+      # That is why every rpm shipped two identical launcher entries. Stopping
+      # the rpm injection leaves exactly one entry — Tauri's — and needs no
+      # repacking, which is far more reliable than rewriting a built package.
+      - name: Remove Pake's duplicate rpm launcher entry
+        if: matrix.os == 'linux'
+        shell: bash
+        run: |
+          set -uo pipefail
+          cli="$(npm root -g)/pake-cli/dist/cli.js"
+          if [ ! -f "$cli" ]; then
+            echo "::warning::$cli not found; the rpm may ship two launcher entries"
+            exit 0
+          fi
+          node -e '
+            const fs = require("fs");
+            const file = process.argv[1];
+            const before = fs.readFileSync(file, "utf8");
+            const pattern = /linuxBundle\.rpm\.files\s*=\s*\{\s*\[desktopInstallPath\]:\s*`assets\/\$\{desktopFileName\}`,?\s*\};/;
+            if (!pattern.test(before)) {
+              console.log("::warning::pake internals changed; falling back to repacking the rpm");
+              process.exit(0);
+            }
+            fs.writeFileSync(file, before.replace(pattern, "linuxBundle.rpm.files = {};"));
+            console.log("pake patched: rpm will ship a single launcher entry");
+          ' "$cli"
+
       - name: Get resolved icon
         if: needs.setup.outputs.icon == 'true'
         uses: actions/download-artifact@v4
@@ -392,7 +420,17 @@ jobs:
             rm -rf "$work"
           done
 
-          rpms=(dist/*.rpm)
+          rpms=()
+          for candidate in dist/*.rpm; do
+            entries=$(rpm -qlp "$candidate" 2>/dev/null | grep -c '\.desktop$' || echo 0)
+            if [ "${entries:-0}" -gt 1 ]; then
+              rpms+=("$candidate")
+            else
+              echo "  $(basename "$candidate"): ${entries:-?} launcher entry, no repack needed"
+            fi
+          done
+          # Repacking is the fallback: only a package that still carries a
+          # duplicate is worth rebuilding, since a rebuild can only add risk.
           [ ${#rpms[@]} -gt 0 ] || exit 0
 
           for tool in rpm rpm2cpio rpmbuild cpio; do
@@ -405,6 +443,7 @@ jobs:
           for tool in rpm rpm2cpio rpmbuild cpio; do
             if ! command -v "$tool" >/dev/null 2>&1; then
               echo "::error::$tool unavailable; the rpm keeps its duplicate launcher entry."
+              printf 'rpm repack skipped: %s unavailable\n' "$tool" >> dedup-notes.txt
               exit 0
             fi
           done
@@ -417,10 +456,12 @@ jobs:
             arch=$(rpm -qp --qf '%{ARCH}'    "$rpm_in" 2>/dev/null)
             lic=$( rpm -qp --qf '%{LICENSE}' "$rpm_in" 2>/dev/null)
             if [ -z "$name" ]; then
-              echo "::warning::could not read $rpm_in; shipping it as built"; continue
+              echo "::warning::could not read $rpm_in; shipping it as built"
+              printf 'rpm repack skipped: could not read metadata\n' >> dedup-notes.txt; continue
             fi
             if ! rpm2cpio "$rpm_in" | (cd "$root" && cpio -idm --quiet); then
-              echo "::warning::could not extract $rpm_in; shipping it as built"; continue
+              echo "::warning::could not extract $rpm_in; shipping it as built"
+              printf 'rpm repack skipped: rpm2cpio/cpio could not extract the payload\n' >> dedup-notes.txt; continue
             fi
 
             prune "$root/usr/share/applications" "$(basename "$rpm_in")"
