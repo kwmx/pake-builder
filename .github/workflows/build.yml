@@ -114,6 +114,63 @@ jobs:
         shell: bash
         run: npm install -g "pake-cli@${PAKE_VERSION}"
 
+      # Pake has no --description option: its config schema declares
+      # additionalProperties:false with no description field, and its
+      # tauri.conf.json carries no bundle description either. tauri-bundler
+      # therefore falls back to the Rust crate description, which is why every
+      # packaged app has been advertising Pake's own tagline. Rewriting that one
+      # line before the build fixes deb, rpm, AppImage, msi and dmg together.
+      - name: Set app description
+        if: inputs.description != ''
+        shell: bash
+        env:
+          PAKE_DESC: ${{ inputs.description }}
+        run: |
+          set -uo pipefail
+          manifest="$(npm root -g)/pake-cli/src-tauri/Cargo.toml"
+          if [ ! -f "$manifest" ]; then
+            echo "::warning::$manifest not found; keeping Pake's own description"
+            exit 0
+          fi
+          node -e '
+            const fs = require("fs");
+            const [file, desc] = process.argv.slice(1);
+            const before = fs.readFileSync(file, "utf8");
+            const after = before.replace(/^description\s*=\s*".*"$/m, "description = " + JSON.stringify(desc));
+            if (after === before) { console.log("::warning::no description line in Cargo.toml"); }
+            else { fs.writeFileSync(file, after); console.log("app description set to: " + desc); }
+          ' "$manifest" "$PAKE_DESC"
+
+      # Pake silently falls back to its own icon when a favicon cannot be
+      # fetched, which is how apps ended up shipping the Pake logo. Resolve the
+      # icon here so a failure is visible in the log instead.
+      - name: Fetch app icon
+        if: inputs.icon != ''
+        shell: bash
+        env:
+          PAKE_ICON: ${{ inputs.icon }}
+        run: |
+          set -uo pipefail
+          if ! curl -fsSL --max-time 30 "$PAKE_ICON" -o icon.bin; then
+            echo "::warning::could not download $PAKE_ICON - falling back to the site favicon"
+            exit 0
+          fi
+          ext=$(node -e '
+            const b = require("fs").readFileSync("icon.bin");
+            const is = (...bytes) => bytes.every((v, i) => b[i] === v);
+            if (is(0x89,0x50,0x4e,0x47)) process.stdout.write("png");
+            else if (is(0x00,0x00,0x01,0x00)) process.stdout.write("ico");
+            else if (b.slice(0,4).toString() === "icns") process.stdout.write("icns");
+            else process.stdout.write("");
+          ')
+          if [ -z "$ext" ]; then
+            echo "::warning::$PAKE_ICON is not a PNG, ICO or ICNS - falling back to the site favicon"
+            exit 0
+          fi
+          mv icon.bin "app-icon.$ext"
+          echo "PAKE_ICON_FILE=$(pwd)/app-icon.$ext" >> "$GITHUB_ENV"
+          echo "using icon: app-icon.$ext"
+
       - name: Build
         shell: bash
         env:
@@ -130,8 +187,9 @@ jobs:
           mkdir -p dist
 
           args=(--name "$PAKE_NAME" --width "$PAKE_WIDTH" --height "$PAKE_HEIGHT")
-          if [ -n "$PAKE_ICON" ]; then
-            args+=(--icon "$PAKE_ICON")
+          # Set by the icon step only when the download produced a real image.
+          if [ -n "${PAKE_ICON_FILE:-}" ]; then
+            args+=(--icon "$PAKE_ICON_FILE")
           fi
           # Linux is the only platform where --targets selects FORMATS. The CLI
           # keeps going if one format fails, so .deb/.rpm still ship even if the
@@ -149,37 +207,74 @@ jobs:
 
           echo "Produced:"; ls -la dist/
 
-      # Pake has no --description flag (its config schema sets
-      # additionalProperties:false and omits one), so every package inherits
-      # Pake's own tagline. Software centres read the .desktop Comment and the
-      # deb control Description, so rewrite both here. Linux only, and never
-      # fatal: a failed rewrite must not throw away a working installer.
-      - name: Apply description to Linux packages
-        if: matrix.os == 'linux' && inputs.description != ''
+      # Pake injects its own com.pake.<name>.desktop into both the deb and the
+      # rpm, but only strips Tauri's auto-generated duplicate on the deb path.
+      # The rpm therefore ships two identical launcher entries. Repack it.
+      - name: De-duplicate Linux rpm launcher entry
+        if: matrix.os == 'linux'
         shell: bash
+        continue-on-error: true
         env:
           PAKE_DESC: ${{ inputs.description }}
-        continue-on-error: true
         run: |
           set -uo pipefail
           shopt -s nullglob
-          escaped=$(printf '%s' "$PAKE_DESC" | tr '\n' ' ' | sed 's/[&|]/\\&/g')
+          rpms=(dist/*.rpm)
+          [ ${#rpms[@]} -gt 0 ] || { echo "no rpm built, nothing to do"; exit 0; }
+          sudo apt-get update -qq && sudo apt-get install -y -qq rpm cpio
 
-          for deb in dist/*.deb; do
-            work=$(mktemp -d)
-            if ! dpkg-deb -R "$deb" "$work"; then
-              echo "::warning::could not unpack $deb, leaving it as built"
-              rm -rf "$work"; continue
+          for rpm_in in "${rpms[@]}"; do
+            work=$(mktemp -d); root="$work/root"; mkdir -p "$root"
+            name=$(rpm -qp --qf '%{NAME}'    "$rpm_in" 2>/dev/null)
+            ver=$( rpm -qp --qf '%{VERSION}' "$rpm_in" 2>/dev/null)
+            rel=$( rpm -qp --qf '%{RELEASE}' "$rpm_in" 2>/dev/null)
+            arch=$(rpm -qp --qf '%{ARCH}'    "$rpm_in" 2>/dev/null)
+            lic=$( rpm -qp --qf '%{LICENSE}' "$rpm_in" 2>/dev/null)
+            desc="${PAKE_DESC:-$(rpm -qp --qf '%{SUMMARY}' "$rpm_in" 2>/dev/null)}"
+            if [ -z "$name" ]; then
+              echo "::warning::could not read $rpm_in, leaving it as built"; continue
             fi
-            sed -i "s|^Description:.*|Description: ${escaped}|" "$work/DEBIAN/control"
-            for desktop in "$work"/usr/share/applications/*.desktop; do
-              if grep -q '^Comment=' "$desktop"; then
-                sed -i "s|^Comment=.*|Comment=${escaped}|" "$desktop"
+
+            rpm2cpio "$rpm_in" | (cd "$root" && cpio -idm --quiet) || {
+              echo "::warning::could not extract $rpm_in, leaving it as built"; continue; }
+
+            dup="$root/usr/share/applications/${name}.desktop"
+            own="$root/usr/share/applications/com.pake.${name}.desktop"
+            if [ -f "$dup" ] && [ -f "$own" ]; then
+              rm -f "$dup"
+              echo "removed duplicate launcher entry: ${name}.desktop"
+            else
+              echo "no duplicate found in $(basename "$rpm_in") - upstream may have fixed it"
+            fi
+
+            for entry in "$root"/usr/share/applications/*.desktop; do
+              [ -f "$entry" ] || continue
+              if grep -q '^Comment=' "$entry"; then
+                sed -i "s|^Comment=.*|Comment=${desc}|" "$entry"
               else
-                printf 'Comment=%s\n' "$PAKE_DESC" >> "$desktop"
+                printf 'Comment=%s\n' "$desc" >> "$entry"
               fi
             done
-            dpkg-deb -b "$work" "$deb" >/dev/null && echo "described: $(basename "$deb")"
+
+            spec="$work/app.spec"
+            {
+              echo "%global debug_package %{nil}"
+              echo "%define _build_id_links none"
+              echo "Name: $name"; echo "Version: $ver"; echo "Release: $rel"
+              echo "Summary: $desc"; echo "License: ${lic:-unknown}"
+              echo "BuildArch: $arch"
+              echo "%description"; echo "$desc"
+              echo "%files"
+              find "$root" -mindepth 1 \( -type f -o -type l \) -printf '/%P\n' | sed 's/[][*?%]/\\&/g'
+            } > "$spec"
+
+            if rpmbuild -bb --define "_topdir $work/rpmbuild" --buildroot "$root" "$spec" > "$work/log" 2>&1; then
+              rebuilt=$(find "$work/rpmbuild/RPMS" -name '*.rpm' | head -1)
+              [ -n "$rebuilt" ] && mv -f "$rebuilt" "$rpm_in" && echo "repacked $(basename "$rpm_in")"
+            else
+              echo "::warning::rpmbuild failed for $rpm_in, shipping it as built"
+              tail -8 "$work/log"
+            fi
             rm -rf "$work"
           done
 
