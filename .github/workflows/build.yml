@@ -54,7 +54,7 @@ env:
   PAKE_VERSION: "3.15.3"
   # Printed in the run log. If a build misbehaves, check this first — an older
   # revision still on the builder repo explains most "the fix didn't work".
-  WORKFLOW_REVISION: "5 - icon polish, verified rpm de-duplication"
+  WORKFLOW_REVISION: "6 - any image format for icons, scaled to fill"
 
 jobs:
   setup:
@@ -89,12 +89,25 @@ jobs:
           PAKE_URL: ${{ inputs.url }}
         run: |
           set -uo pipefail
+          # ImageMagick delegates SVG to rsvg-convert. Without it every SVG icon
+          # fails to convert and the app quietly falls back to Pake's logo.
+          if ! command -v rsvg-convert >/dev/null 2>&1; then
+            sudo apt-get update -qq \
+              && sudo apt-get install -y -qq librsvg2-bin \
+              || echo "::warning::librsvg2-bin unavailable; SVG icons will be skipped"
+          fi
+
+          # Meta answers anything claiming to be Chrome with a 400, while other
+          # hosts reject non-browsers, so the page is tried both ways.
+          UA_BOT='Mozilla/5.0 (compatible; pake-cloud-builder/1.0)'
           UA='Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36'
           host=$(node -e 'process.stdout.write(new URL(process.argv[1]).host)' "$PAKE_URL")
           origin=$(node -e 'const u=new URL(process.argv[1]);process.stdout.write(u.origin)' "$PAKE_URL")
 
           # Icons declared by the page itself, largest first.
-          page_icons=$(curl -fsSL --max-time 20 -A "$UA" "$PAKE_URL" 2>/dev/null | node -e '
+          page_html=$(curl -fsSL --max-time 20 -A "$UA_BOT" "$PAKE_URL" 2>/dev/null)
+          [ -n "$page_html" ] || page_html=$(curl -fsSL --max-time 20 -A "$UA" "$PAKE_URL" 2>/dev/null)
+          page_icons=$(printf '%s' "$page_html" | node -e '
             let html = "";
             process.stdin.on("data", (c) => (html += c)).on("end", () => {
               const base = process.argv[1];
@@ -128,11 +141,14 @@ jobs:
             [ -n "$candidate" ] || continue
             curl -fsSL --max-time 20 -A "$UA" -e "$PAKE_URL" "$candidate" -o raw.bin 2>/dev/null || continue
             [ -s raw.bin ] || continue
-            # ImageMagick reads ico/png/jpg/webp/svg and normalises to a square PNG.
-            if convert "raw.bin[0]" -background none -resize 512x512\> \
-                 -gravity center -extent 512x512 PNG32:icon.png 2>/dev/null; then
-              px=$(identify -format '%w' icon.png 2>/dev/null || echo 0)
-              if [ "${px:-0}" -ge 48 ]; then resolved="$candidate"; break; fi
+            # ImageMagick reads ico/png/jpg/webp/gif/bmp/avif/svg. -density only
+            # affects vector input and gives SVGs a usable raster size.
+            # The content is scaled to fill 448 rather than shrink-only: a 64px
+            # favicon left at native size would sit tiny inside a 512 canvas.
+            if convert -background none -density 384 "raw.bin[0]" \
+                 -resize 448x448 -gravity center -extent 512x512 PNG32:icon.png 2>/dev/null; then
+              px=$(identify -format '%w' "raw.bin[0]" 2>/dev/null || echo 0)
+              if [ "${px:-0}" -ge 32 ]; then resolved="$candidate"; break; fi
             fi
           done < candidates.txt
 
@@ -146,8 +162,7 @@ jobs:
             # already carries transparency is deliberately shaped, so leave it.
             opaque=$(identify -format '%[opaque]' icon.png 2>/dev/null || echo unknown)
             if [ "$opaque" = "true" ] || [ "$opaque" = "True" ]; then
-              if convert icon.png -resize 448x448 -background none -gravity center \
-                   -extent 512x512 PNG32:_base.png 2>/dev/null \
+              if cp icon.png _base.png \
                  && convert -size 512x512 xc:black -fill white \
                       -draw "roundrectangle 32,32 479,479 96,96" -alpha off _mask.png 2>/dev/null \
                  && convert _base.png _mask.png -alpha off -compose CopyOpacity \
