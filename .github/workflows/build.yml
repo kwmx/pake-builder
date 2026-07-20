@@ -70,6 +70,10 @@ jobs:
 
   build:
     needs: setup
+    # Explicit name so the job is "build (linux)" rather than GitHub's default
+    # "build (linux, ubuntu-latest)" — the control plane reads the platform
+    # back out of this string to track per-platform progress.
+    name: build (${{ matrix.os }})
     strategy:
       fail-fast: false
       matrix: ${{ fromJSON(needs.setup.outputs.matrix) }}
